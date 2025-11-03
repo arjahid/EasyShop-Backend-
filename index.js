@@ -40,6 +40,7 @@ async function run() {
     const WishlistCollection = client.db("EasyShopDB").collection("wishlist");
     const userCollection = client.db("EasyShopDB").collection("users");
     const userBehaviour = client.db("EasyShopDB").collection("userBehaviour");
+    const orderCollection = client.db("EasyShopDB").collection("orders");
 
     app.get('/products', async (req, res) => {
       const products = await ProductCollection.find({}).toArray();
@@ -129,6 +130,33 @@ async function run() {
       }
     });
 
+
+
+    // DELETE product by productId
+    // pore fix korobo
+    app.delete('/products/:productId', async (req, res) => {
+      const productId = req.params.productId;
+      console.log("Trying to delete product with productId:", productId);
+
+      try {
+        const result = await ProductCollection.deleteOne({ productId: productId });
+        console.log("Delete result:", result);
+
+        if (result.deletedCount === 1) {
+          return res.status(200).json({ message: "Product deleted successfully" });
+        } else {
+          return res.status(404).json({ error: "Product not found" });
+        }
+      } catch (err) {
+        console.error("Error deleting product:", err);
+        res.status(500).json({ error: "Failed to delete product" });
+      }
+    });
+
+
+
+
+
     // ⁡⁢⁣⁣ search products by name⁡
     app.get('/products/search/:name', async (req, res) => {
       const searchQuery = decodeURIComponent(req.params.name).trim();
@@ -169,6 +197,63 @@ async function run() {
       const result = await CartCollection.deleteOne(query);
       res.json(result);
     });
+    app.delete('/cart/clear', async (req, res) => {
+      try {
+        const email = req.query.email;
+        if (!email) return res.status(400).json({ message: 'Email required' });
+
+        const result = await CartCollection.deleteMany({ email });
+        res.json({ message: 'Cart cleared', deletedCount: result.deletedCount });
+      } catch (error) {
+        console.error(error);
+        res.status(500).json({ message: 'Failed to clear cart' });
+      }
+    });
+
+    // order apis
+    app.post('/orders', async (req, res) => {
+      const order = req.body;
+      const result = await orderCollection.insertOne(order);
+      res.json(result);
+    })
+    app.get('/orders', async (req, res) => {
+      try {
+        const email = req.query.email; // optional
+        const role = req.query.role;   // admin or user (optional but useful)
+
+        let query = {};
+
+        // 🔹 যদি admin না হয়, তাহলে শুধু নিজের order
+        if (role !== "admin" && email) {
+          query = {
+            $or: [
+              { userEmail: email },
+              { "items.email": email }
+            ]
+          };
+        }
+
+        // 🔹 যদি admin হয়, তাহলে সব order পাবে (query = {} মানে সব)
+        const orders = await orderCollection.find(query).toArray();
+
+        res.json(orders);
+
+      } catch (error) {
+        console.error("Error fetching orders:", error);
+        res.status(500).json({ message: "Failed to fetch orders" });
+      }
+    });
+    app.patch('/orders/:id', async (req, res) => {
+      const id = req.params.id;
+      const { status } = req.body;
+      const result = await orderCollection.updateOne(
+        { _id: new ObjectId(id) },
+        { $set: { status: status } }
+      );
+      res.json(result);
+    });
+
+
 
     // ⁡⁢⁣⁣Contact Message APIs⁡
 
@@ -218,10 +303,10 @@ async function run() {
     // ⁡⁢⁣⁣make admin api⁡
     app.patch('/users/admin/:email', async (req, res) => {
       const email = req.params.email;
-      const {role }= req.body;
+      const { role } = req.body;
       const result = await userCollection.updateOne(
         { email: email },
-          { $set: { role: role || 'customer' } }
+        { $set: { role: role || 'customer' } }
       );
       res.json(result);
     })
@@ -242,40 +327,84 @@ async function run() {
       res.json(result);
     })
     // ⁡⁢⁣⁣recomandation api⁡
+
+
+
+
+    // Recommendation API: match behaviour.productId to product _id (ObjectId/string) or product.productId
+
+
+    // Robust Recommendation API
     app.get('/recommendation', async (req, res) => {
       try {
-        const email = req.query.email;
-        if (!email) {
-          return res.status(400).json({ error: "Email query parameter is required" });
-        }
+        const email = (req.query.email || '').trim();
+        if (!email) return res.status(400).json({ error: "Email query parameter is required" });
 
-        const userBehaviours = await userBehaviour
+        // fetch recent behaviours
+        const behaviours = await userBehaviour
           .find({ email })
           .sort({ timeStamp: -1 })
-          .limit(10)
+          .limit(50)
           .toArray();
 
-        if (!userBehaviours.length) {
-          return res.json([]);
+        if (!behaviours.length) return res.json([]);
+
+        // For each behaviour try to resolve a product using several strategies
+        const matchedProducts = [];
+        for (const b of behaviours) {
+          const val = String(b.productId ?? b._id ?? '').trim();
+          if (!val) continue;
+
+          let product = null;
+
+          // 1) try as ObjectId
+          if (ObjectId.isValid(val) && val.length === 24) {
+            try {
+              product = await ProductCollection.findOne({ _id: new ObjectId(val) });
+            } catch (e) { /* ignore */ }
+          }
+
+          // 2) try as string _id
+          if (!product) {
+            product = await ProductCollection.findOne({ _id: val });
+          }
+
+          // 3) try by productId field (like "P1006")
+          if (!product) {
+            product = await ProductCollection.findOne({ productId: val });
+          }
+
+          if (product) matchedProducts.push(product);
         }
 
-        const productIds = userBehaviours.map(b => new ObjectId(b.productId));
+        if (!matchedProducts.length) return res.json([]);
 
-        const viewedProducts = await ProductCollection
-          .find({ _id: { $in: productIds } })
-          .toArray();
-        const categories = [...new Set(viewedProducts.map(p => p.category))];
-        const recommendedProducts = await ProductCollection
-          .find({ category: { $in: categories } })
-          .limit(10)
-          .toArray();
+        // extract categories and prepare exclusion lists
+        const categories = [...new Set(matchedProducts.map(p => p.category).filter(Boolean))];
+        const excludeObjectIds = matchedProducts
+          .map(p => p._id)
+          .filter(Boolean)
+          .map(id => (typeof id === 'string' && ObjectId.isValid(id) ? new ObjectId(id) : id));
+        const excludeProductIds = matchedProducts.map(p => p.productId).filter(Boolean);
 
-        res.json(recommendedProducts);
+        // build recommendation query
+        const recQuery = {
+          category: { $in: categories },
+          $nor: []
+        };
+        if (excludeObjectIds.length) recQuery.$nor.push({ _id: { $in: excludeObjectIds } });
+        if (excludeProductIds.length) recQuery.$nor.push({ productId: { $in: excludeProductIds } });
+
+        const recommended = await ProductCollection.find(recQuery).limit(10).toArray();
+        return res.json(recommended);
       } catch (error) {
-        console.error(error);
-        res.status(500).json({ error: "Failed to fetch recommendations" });
+        console.error("Recommendation error:", error);
+        return res.status(500).json({ error: "Failed to fetch recommendations" });
       }
     });
+
+
+
     // ⁡⁢⁣⁣Analytics Dashboard APIs⁡
     app.get('/analytics', async (req, res) => {
       try {
@@ -310,7 +439,7 @@ async function run() {
           { $sort: { count: -1 } },
           { $limit: 10 }
         ]).toArray();
-        
+
         const wishlist = await userBehaviour.aggregate([
           { $match: { action: { $in: ["add_to_wishlist", "wishlist"] } } }, // match both possible action values
           { $group: { _id: "$productId", count: { $sum: 1 } } },
